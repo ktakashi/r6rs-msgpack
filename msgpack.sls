@@ -31,8 +31,7 @@
 #!r6rs
 (library (msgpack)
     (export pack! pack pack-size
-	    #;unpack
-	    )
+	    unpack)
     (import (for (rnrs) run expand)
 	    (for (rnrs eval) expand)
 	    ;; Ypsilon doesn't allow this style
@@ -275,4 +274,102 @@
       (apply pack! bv message opt)
       bv))
 
+  ;; unpack
+  (define (unpack-map bv offset count) 
+    (let loop ((i 0)
+	       (offset offset)
+	       (r '()))
+      (if (= i count)
+	  (reverse r)
+	  (let* ((key (unpack* bv offset))
+		 (key-off (+ (pack-size key) offset))
+		 (value (unpack* bv key-off)))
+	    (loop (+ i 1) (+ key-off (pack-size value))
+		  (cons (cons key value) r))))))
+
+  (define (unpack-array bv offset count)
+    (let ((v (make-vector count)))
+      (let loop ((i 0) (offset offset))
+	(if (= i count)
+	    v
+	    (let ((o (unpack* bv offset)))
+	      (vector-set! v i o)
+	      ;; FIXME, how should we get proper offset of the given bytevector?
+	      (loop (+ i 1) (+ (pack-size o) offset)))))))
+
+  (define (unpack-raw bv offset count)
+    ;; For R6RS compatible, we can't use extended bytevector-copy.
+    (let ((o (make-bytevector count)))
+      (bytevector-copy! bv offset o 0 count)
+      ((*message->string*) o)))
+
+  (define (unpack-fix-collection bv first offset)
+    (case (bitwise-and first #x30)
+      ((0)  (unpack-map bv (+ offset 1) (bitwise-and first #x0F)))
+      ((16) (unpack-array bv (+ offset 1) (bitwise-and first #x0F)))
+      (else (unpack-raw bv (+ offset 1) (bitwise-and first #x1F)))))
+
+  (define (integer-ref indicator uint?)
+    (case indicator
+      ((1) (if uint? bytevector-u16-ref bytevector-s16-ref))
+      ((2) (if uint? bytevector-u32-ref bytevector-s32-ref))
+      ((3) (if uint? bytevector-u64-ref bytevector-s64-ref))
+      (else (error 'integer-ref "invalid indicator"))))
+
+  (define (unpack-uint bv type offset)
+    (if (= type #xCC)
+	(bytevector-u8-ref bv offset)
+	(let ((ref (integer-ref (bitwise-and type #x03) #t)))
+	  (ref bv offset (endianness big)))))
+
+  (define (unpack-sint bv type offset)
+    (if (= type #xD0)
+	(bytevector-s8-ref bv offset)
+	(let ((ref (integer-ref (bitwise-and type #x03) #f)))
+	  (ref bv offset (endianness big)))))
+
+  (define (collection-ref short?)
+    (if short?
+	(values 3 bytevector-u16-ref)
+	(values 5 bytevector-u32-ref)))
+
+  (define (unpack* bv offset)
+    (let ((type (bytevector-u8-ref bv offset)))
+      (cond ((= #xC0 type) '())
+	    ((= #xC2 type) #f)
+	    ((= #xC3 type) #t)
+	    ((zero? (bitwise-and type #x80))  ;; positive fixnum
+	     (bitwise-and type #x7FF))
+	    ((= #xE0 (bitwise-and type #xE0)) ;; negative fixnum
+	     (- (bitwise-and type #x1F) 32))
+	    ((= #x80 (bitwise-and type #xC0)) ;; fix map, array or raw
+	     (unpack-fix-collection bv type offset))
+	    ((= #x32 (ash type -2)) ;; flonum
+	     (if (even? type)
+		 (bytevector-ieee-single-ref bv (+ offset 1) (endianness big))
+		 (bytevector-ieee-double-ref bv (+ offset 1) (endianness big))))
+	    ((= #x33 (ash type -2)) ;; unsigned int
+	     (unpack-uint bv type (+ offset 1)))
+	    ((= #x34 (ash type -2)) ;; signed int
+	     (unpack-sint bv type (+ offset 1)))
+	    ((= #b110110 (ash type -2)) ;; raw 16 or 32
+	     (let-values (((off ref) (collection-ref (even? type))))
+	       (unpack-raw bv (+ offset off)
+			   (ref bv (+ offset 1) (endianness big)))))
+	    ((= #b1101110 (ash type -1)) ;; array 16 or 32
+	     (let-values (((off ref) (collection-ref (even? type))))
+	       (unpack-array bv (+ offset off)
+			     (ref bv (+ offset 1) (endianness big)))))
+	    ((= #b1101111 (ash type -1)) ;; map 16 or 32
+	     (let-values (((off ref) (collection-ref (even? type))))
+	       (unpack-map bv (+ offset off)
+			   (ref bv (+ offset 1) (endianness big)))))
+	    (else (error 'unpack "unknown tag" type bv)))))
+
+
+  (define (unpack bv . opt)
+    (let-optionals* opt ((offset 0)
+			 (message->string utf8->string))
+      (parameterize ((*message->string* message->string))
+	(unpack* bv offset))))
 )
