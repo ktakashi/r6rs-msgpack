@@ -7,9 +7,9 @@ R6RS Scheme.
 API references
 --------
 
-[Function] (pack! bv message)   
-[Function] (pack! bv message offset)   
-[Function] (pack! bv message offset string->message)
+_Function_ (pack! bv message)   
+_Function_ (pack! bv message offset)   
+_Function_ (pack! bv message offset string->message)
 
 Pack *message* to message pack format bytevector and put it into the
 *bv* destructively. Given *bv* must have enough length to hold the message.
@@ -18,18 +18,18 @@ Optional argument *offset* indicates where to start with, default is 0.
 Optional argument *string->message* specify how to convert string object
 to message, default is **string->utf8**
 
-[Function] (pack message)   
-[Function] (pack message string->message)
+_Function_ (pack message)   
+_Function_ (pack message string->message)
 
 The same as **pack!** but this one creates a new bytevector.
 
-[Function] (pack-size message)
+_Function_ (pack-size message)
 
 Calculate the converted message size.
 
-[Function] (unpack bv)   
-[Function] (unpack bv offset)  
-[Function] (unpack bv offset message->string)
+_Function_ (unpack bv)   
+_Function_ (unpack bv offset)  
+_Function_ (unpack bv offset message->string)
 
 Unpack the given message format bytevector to Scheme object.
 
