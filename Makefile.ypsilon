@@ -1,0 +1,5 @@
+# -*- mode:makefile; coding:utf-8; -*-
+LOAD_PATH=$(shell pwd)
+SCM=ypsilon --sitelib=$(LOAD_PATH) --sitelib=$(LOAD_PATH)/test-lib
+
+-include Makefile.incl

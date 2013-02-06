@@ -1,0 +1,6 @@
+# -*- mode:makefile; coding:utf-8; -*-
+
+all: test
+
+test:
+	cd tests; $(SCM) test.scm

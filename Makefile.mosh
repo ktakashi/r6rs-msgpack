@@ -1,0 +1,5 @@
+# -*- mode:makefile; coding:utf-8; -*-
+LOAD_PATH=$(shell pwd)
+SCM=mosh --loadpath=$(LOAD_PATH)
+
+-include Makefile.incl
