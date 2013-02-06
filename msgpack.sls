@@ -47,34 +47,33 @@
   (define-syntax %let-optionals*
     (syntax-rules ()
       ((%let-optionals* arg (((var ...) xparser) opt-clause ...) body ...)
-       (call-with-values (lambda () (xparser arg))
-         (lambda (rest var ...)
-           (%let-optionals* rest (opt-clause ...) body ...))))
+       (let-values (((rest var ...) (xparser arg)))
+	 (%let-optionals* rest (opt-clause ...) body ...)))
 
       ((%let-optionals* arg ((var default) opt-clause ...) body ...)
-       (call-with-values (lambda () (if (null? arg) (values default '())
-                                        (values (car arg) (cdr arg))))
-         (lambda (var rest)
-           (%let-optionals* rest (opt-clause ...) body ...))))
+       (let-values (((var rest) (if (null? arg)
+				    (values default '())
+				    (values (car arg) (cdr arg)))))
+	 (%let-optionals* rest (opt-clause ...) body ...)))
 
       ((%let-optionals* arg ((var default test) opt-clause ...) body ...)
-       (call-with-values (lambda ()
-                           (if (null? arg) (values default '())
-                               (let ((var (car arg)))
-                                 (if test (values var (cdr arg))
-                                     (error "arg failed LET-OPT test" var)))))
-         (lambda (var rest)
-           (%let-optionals* rest (opt-clause ...) body ...))))
+       (let-values (((var rest) (if (null? arg)
+				    (values default '())
+				    (let ((var (car arg)))
+				      (if test 
+					  (values var (cdr arg))
+					  (error "arg failed LET-OPT test"
+						 var))))))
+	 (%let-optionals* rest (opt-clause ...) body ...)))
 
       ((%let-optionals* arg ((var default test supplied?) opt-clause ...)
 			body ...)
-       (call-with-values (lambda ()
-                           (if (null? arg) (values default #f '())
-                               (let ((var (car arg)))
-                                 (if test (values var #t (cdr arg))
-                                     (error "arg failed LET-OPT test" var)))))
-         (lambda (var supplied? rest)
-           (%let-optionals* rest (opt-clause ...) body ...))))
+       (let-values (((var supplied? rest)
+		     (if (null? arg) (values default #f '())
+			 (let ((var (car arg)))
+			   (if test (values var #t (cdr arg))
+			       (error "arg failed LET-OPT test" var))))))
+	 (%let-optionals* rest (opt-clause ...) body ...)))
 
       ((%let-optionals* arg (rest) body ...)
        (let ((rest arg)) body ...))
@@ -271,7 +270,7 @@
 
   (define (pack message . opt)
     (let ((bv (make-bytevector (apply pack-size message opt))))
-      (apply pack! bv message opt)
+      (apply pack! bv message 0 opt)
       bv))
 
   ;; unpack
@@ -280,28 +279,25 @@
 	       (offset offset)
 	       (r '()))
       (if (= i count)
-	  (reverse r)
-	  (let* ((key (unpack* bv offset))
-		 (key-off (+ (pack-size key) offset))
-		 (value (unpack* bv key-off)))
-	    (loop (+ i 1) (+ key-off (pack-size value))
-		  (cons (cons key value) r))))))
+	  (values offset (reverse r))
+	  (let*-values (((key-off key) (unpack* bv offset))
+			((value-off value) (unpack* bv key-off)))
+	    (loop (+ i 1) value-off (cons (cons key value) r))))))
 
   (define (unpack-array bv offset count)
     (let ((v (make-vector count)))
       (let loop ((i 0) (offset offset))
 	(if (= i count)
-	    v
-	    (let ((o (unpack* bv offset)))
+	    (values offset v)
+	    (let-values (((off o) (unpack* bv offset)))
 	      (vector-set! v i o)
-	      ;; FIXME, how should we get proper offset of the given bytevector?
-	      (loop (+ i 1) (+ (pack-size o) offset)))))))
+	      (loop (+ i 1) off))))))
 
   (define (unpack-raw bv offset count)
     ;; For R6RS compatible, we can't use extended bytevector-copy.
     (let ((o (make-bytevector count)))
       (bytevector-copy! bv offset o 0 count)
-      ((*message->string*) o)))
+      (values (+ offset count) ((*message->string*) o))))
 
   (define (unpack-fix-collection bv first offset)
     (case (bitwise-and first #x30)
@@ -311,22 +307,22 @@
 
   (define (integer-ref indicator uint?)
     (case indicator
-      ((1) (if uint? bytevector-u16-ref bytevector-s16-ref))
-      ((2) (if uint? bytevector-u32-ref bytevector-s32-ref))
-      ((3) (if uint? bytevector-u64-ref bytevector-s64-ref))
+      ((1) (values 2 (if uint? bytevector-u16-ref bytevector-s16-ref)))
+      ((2) (values 4 (if uint? bytevector-u32-ref bytevector-s32-ref)))
+      ((3) (values 8 (if uint? bytevector-u64-ref bytevector-s64-ref)))
       (else (error 'integer-ref "invalid indicator"))))
 
   (define (unpack-uint bv type offset)
     (if (= type #xCC)
-	(bytevector-u8-ref bv offset)
-	(let ((ref (integer-ref (bitwise-and type #x03) #t)))
-	  (ref bv offset (endianness big)))))
+	(values (+ offset 1) (bytevector-u8-ref bv offset))
+	(let-values (((off ref) (integer-ref (bitwise-and type #x03) #t)))
+	  (values (+ offset off) (ref bv offset (endianness big))))))
 
   (define (unpack-sint bv type offset)
     (if (= type #xD0)
-	(bytevector-s8-ref bv offset)
-	(let ((ref (integer-ref (bitwise-and type #x03) #f)))
-	  (ref bv offset (endianness big)))))
+	(values (+ offset 1) (bytevector-s8-ref bv offset))
+	(let-values (((off ref) (integer-ref (bitwise-and type #x03) #f)))
+	  (values (+ offset off) (ref bv offset (endianness big))))))
 
   (define (collection-ref short?)
     (if short?
@@ -335,19 +331,24 @@
 
   (define (unpack* bv offset)
     (let ((type (bytevector-u8-ref bv offset)))
-      (cond ((= #xC0 type) '())
-	    ((= #xC2 type) #f)
-	    ((= #xC3 type) #t)
+      (cond ((= #xC0 type) (values (+ offset 1) '()))
+	    ((= #xC2 type) (values (+ offset 1) #f))
+	    ((= #xC3 type) (values (+ offset 1) #t))
 	    ((zero? (bitwise-and type #x80))  ;; positive fixnum
-	     (bitwise-and type #x7FF))
+	     (values (+ offset 1) (bitwise-and type #x7FF)))
 	    ((= #xE0 (bitwise-and type #xE0)) ;; negative fixnum
-	     (- (bitwise-and type #x1F) 32))
+	     (values (+ offset 1) (- (bitwise-and type #x1F) 32)))
 	    ((= #x80 (bitwise-and type #xC0)) ;; fix map, array or raw
 	     (unpack-fix-collection bv type offset))
 	    ((= #x32 (ash type -2)) ;; flonum
 	     (if (even? type)
-		 (bytevector-ieee-single-ref bv (+ offset 1) (endianness big))
-		 (bytevector-ieee-double-ref bv (+ offset 1) (endianness big))))
+		 (values
+		  (+ offset 5)
+		  (bytevector-ieee-single-ref bv (+ offset 1) (endianness big)))
+		 (values
+		  (+ offset 9)
+		  (bytevector-ieee-double-ref bv (+ offset 1)
+					      (endianness big)))))
 	    ((= #x33 (ash type -2)) ;; unsigned int
 	     (unpack-uint bv type (+ offset 1)))
 	    ((= #x34 (ash type -2)) ;; signed int
@@ -371,5 +372,6 @@
     (let-optionals* opt ((offset 0)
 			 (message->string utf8->string))
       (parameterize ((*message->string* message->string))
-	(unpack* bv offset))))
+	(let-values (((_ o) (unpack* bv offset)))
+	  o))))
 )

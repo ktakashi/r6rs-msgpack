@@ -119,4 +119,13 @@
 (check (unpack (pack '(("foo" . #t) ("data" . #(1 2 3)))))
        => '(("foo" . #t) ("data" . #(1 2 3))))
 
+;; converter
+(check (pack "30" string->utf16) => #vu8(#b10100100 #x00 #x33 #x00 #x30))
+(check (unpack #vu8(#b10100100 #x00 #x33 #x00 #x30) 0
+	       (lambda (bv) (utf16->string bv (endianness big)))) => "30")
+
+(check (unpack (pack '(("30". #t)) string->utf16)
+	       0 (lambda (bv) (utf16->string bv (endianness big))))
+       => '(("30". #t)))
+
 (check-report)
