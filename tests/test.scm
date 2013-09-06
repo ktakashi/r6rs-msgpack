@@ -151,6 +151,7 @@
        => '(("foo" . #t) ("data" . #(1 2 3))))
 
 ;; ext
+;; depending on record's equivness
 (check (pack (make-ext 1)) => #vu8(#xD4 #x01 1))
 (check (unpack #vu8(#xD4 #x01 1)) => (make-ext 1))
 (check (pack (make-my-ext 1 2 3)) => #vu8(#xC7 #x03 #x00 1 2 3))
