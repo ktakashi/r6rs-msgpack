@@ -124,8 +124,8 @@
        (add-pack-table! pred proc))))
 
   (define-syntax define-unpacker
-    (syntax-rules (unpack)
-      ((_ tag (unpack args body ...))
+    (syntax-rules ()
+      ((_ (tag . args) body ...)
        (define-unpacker tag (lambda args body ...)))
       ((_ tag proc)
        (hashtable-set! *unpack-table* tag proc))))
@@ -217,6 +217,7 @@
     (do ((slot *pack-table* (cdr slot)))
 	((or (null? slot) ((caar slot) message))
 	 (if (null? slot)
+	     ;; TODO ext
 	     (error 'pack "the message is not supported" message)
 	     ((cdar slot) bv message offset)))))
 
@@ -233,106 +234,88 @@
       bv))
 
   ;; unpack
-  (define (unpack-map bv offset count) 
-    (let loop ((i 0)
-	       (offset offset)
-	       (r '()))
-      (if (= i count)
-	  (values offset (reverse r))
-	  (let*-values (((key-off key) (unpack* bv offset))
-			((value-off value) (unpack* bv key-off)))
-	    (loop (+ i 1) value-off (cons (cons key value) r))))))
+  ;; len   = fix length or #f
+  ;; bytes = leading length bytes (1, 2, 4 or 8) or #f
+  (define (bytevector-u16b-ref bv index)
+    (bytevector-u16-ref bv index (endianness big)))
+  (define (bytevector-u32b-ref bv index)
+    (bytevector-u32-ref bv index (endianness big)))
+  (define (bytevector-u64b-ref bv index)
+    (bytevector-u64-ref bv index (endianness big)))
+  (define (bytevector-s16b-ref bv index)
+    (bytevector-s16-ref bv index (endianness big)))
+  (define (bytevector-s32b-ref bv index)
+    (bytevector-s32-ref bv index (endianness big)))
+  (define (bytevector-s64b-ref bv index)
+    (bytevector-s64-ref bv index (endianness big)))
 
-  (define (unpack-array bv offset count)
-    (let ((v (make-vector count)))
-      (let loop ((i 0) (offset offset))
+  (define (get-length in bytes)
+    (let ((bv (get-bytevector-n in bytes)))
+      (case bytes
+	((2) (bytevector-u16b-ref bv 0))
+	((4) (bytevector-u32b-ref bv 0))
+	((8) (bytevector-u64b-ref bv 0))
+	(else (error 'get-data "[internal] must be a bug!" bytes)))))
+
+  (define (get-data in len bytes)
+    (if len
+	(get-bytevector-n in len)
+	(if (= bytes 1)
+	    (get-bytevector-n in (get-u8 in))
+	    (let ((n (get-length in bytes)))
+	      (get-bytevector-n in n)))))
+
+  (define (unpack-map in len bytes) 
+    (let ((count (or len (get-length in bytes))))
+      (let loop ((i 0) (r '()))
 	(if (= i count)
-	    (values offset v)
-	    (let-values (((off o) (unpack* bv offset)))
+	    (reverse r)
+	    (let* ((k (unpack* in))
+		   (v (unpack* in)))
+	      (loop (+ i 1) (cons (cons k v) r)))))))
+
+  (define (unpack-array in len bytes)
+    (let* ((count (or len (get-length in bytes)))
+	   (v (make-vector count)))
+      (let loop ((i 0))
+	(if (= i count)
+	    v
+	    (let ((o (unpack* in)))
 	      (vector-set! v i o)
-	      (loop (+ i 1) off))))))
+	      (loop (+ i 1)))))))
 
-  (define (unpack-raw bv offset count)
-    ;; For R6RS compatible, we can't use extended bytevector-copy.
-    (let ((o (make-bytevector count)))
-      (bytevector-copy! bv offset o 0 count)
-      (values (+ offset count) (utf8->string o))))
+  (define (unpack* in)
+    (let ((type (get-u8 in)))
+      ;; handle special case first
+      ;;(display (number->string type 16)) (newline)
+      (cond ((eof-object? type) (error 'unpack "unexpected eof"))
+	    ((zero? (bitwise-and type #x80)) type)
+	    ((= (bitwise-and type #xE0) #xE0) ;; negative fixint
+	     (- (bitwise-and type #x1F)))
+	    ((= (bitwise-and type #xA0) #xA0) ;; fixstr
+	     (let ((bv (get-data in (bitwise-and type #x1F) #f)))
+	       (utf8->string bv)))
+	    ((= (bitwise-and type #x90) #x90) ;; fixarray
+	     (unpack-array in (bitwise-and type #x0F) #f))
+	    ((= (bitwise-and type #x80) #x80) ;; fixmap
+	     (unpack-map in (bitwise-and type #x0F) #f))
+	    (else
+	     ;; dispatch
+	     (let ((proc (hashtable-ref *unpack-table* type #f)))
+	       (if proc
+		   (proc in)
+		   ;; TODO ext
+		   (error 'unpack "not supported" type)))))))
 
-  (define (unpack-fix-collection bv first offset)
-    (case (bitwise-and first #x30)
-      ((0)  (unpack-map bv (+ offset 1) (bitwise-and first #x0F)))
-      ((16) (unpack-array bv (+ offset 1) (bitwise-and first #x0F)))
-      (else (unpack-raw bv (+ offset 1) (bitwise-and first #x1F)))))
-
-  (define (integer-ref indicator uint?)
-    (case indicator
-      ((1) (values 2 (if uint? bytevector-u16-ref bytevector-s16-ref)))
-      ((2) (values 4 (if uint? bytevector-u32-ref bytevector-s32-ref)))
-      ((3) (values 8 (if uint? bytevector-u64-ref bytevector-s64-ref)))
-      (else (error 'integer-ref "invalid indicator"))))
-
-  (define (unpack-uint bv type offset)
-    (if (= type #xCC)
-	(values (+ offset 1) (bytevector-u8-ref bv offset))
-	(let-values (((off ref) (integer-ref (bitwise-and type #x03) #t)))
-	  (values (+ offset off) (ref bv offset (endianness big))))))
-
-  (define (unpack-sint bv type offset)
-    (if (= type #xD0)
-	(values (+ offset 1) (bytevector-s8-ref bv offset))
-	(let-values (((off ref) (integer-ref (bitwise-and type #x03) #f)))
-	  (values (+ offset off) (ref bv offset (endianness big))))))
-
-  (define (collection-ref short?)
-    (if short?
-	(values 3 bytevector-u16-ref)
-	(values 5 bytevector-u32-ref)))
-
-  (define (unpack* bv offset)
-    (let ((type (bytevector-u8-ref bv offset)))
-      (cond ((= #xC0 type) (values (+ offset 1) '()))
-	    ((= #xC2 type) (values (+ offset 1) #f))
-	    ((= #xC3 type) (values (+ offset 1) #t))
-	    ((zero? (bitwise-and type #x80))  ;; positive fixnum
-	     (values (+ offset 1) (bitwise-and type #x7FF)))
-	    ((= #xE0 (bitwise-and type #xE0)) ;; negative fixnum
-	     (values (+ offset 1) (- (bitwise-and type #x1F) 32)))
-	    ((= #x80 (bitwise-and type #xC0)) ;; fix map, array or raw
-	     (unpack-fix-collection bv type offset))
-	    ((= #x32 (ash type -2)) ;; flonum
-	     (if (even? type)
-		 (values
-		  (+ offset 5)
-		  (bytevector-ieee-single-ref bv (+ offset 1) (endianness big)))
-		 (values
-		  (+ offset 9)
-		  (bytevector-ieee-double-ref bv (+ offset 1)
-					      (endianness big)))))
-	    ((= #x33 (ash type -2)) ;; unsigned int
-	     (unpack-uint bv type (+ offset 1)))
-	    ((= #x34 (ash type -2)) ;; signed int
-	     (unpack-sint bv type (+ offset 1)))
-	    ((= #b110110 (ash type -2)) ;; raw 16 or 32
-	     (let-values (((off ref) (collection-ref (even? type))))
-	       (unpack-raw bv (+ offset off)
-			   (ref bv (+ offset 1) (endianness big)))))
-	    ((= #b1101110 (ash type -1)) ;; array 16 or 32
-	     (let-values (((off ref) (collection-ref (even? type))))
-	       (unpack-array bv (+ offset off)
-			     (ref bv (+ offset 1) (endianness big)))))
-	    ((= #b1101111 (ash type -1)) ;; map 16 or 32
-	     (let-values (((off ref) (collection-ref (even? type))))
-	       (unpack-map bv (+ offset off)
-			   (ref bv (+ offset 1) (endianness big)))))
-	    (else (error 'unpack "unknown tag" type bv)))))
-
+  (define get-unpack unpack*)
 
   (define unpack
     (case-lambda
      ((bv) (unpack bv 0))
      ((bv offset)
-      (let-values (((_ o) (unpack* bv offset)))
-	  o))))
+      (let ((in (open-bytevector-input-port bv)))
+	(set-port-position! in offset)
+	(unpack* in)))))
 
   ;; packers R6RS doesn't allow to put this in between so the bottom
   (define-packer (null? bv message offset)
@@ -402,7 +385,7 @@
 	       (error 'pack-map! "alist is required" message))))))
 
   (define-packer (vector? bv message offset)
-    (define-header-writer write-header! bv offset #b10010000 #xDC #xDD)
+    (define-header-writer write-header! bv offset #b10010000 #f #xDC #xDD)
     (let* ((msg-len (vector-length message))
 	   (new-offset (write-header! msg-len)))
       (let loop ((i 0) (offset new-offset))
@@ -410,4 +393,43 @@
 	    offset
 	    (loop (+ i 1) (pack!* bv (vector-ref message i) offset))))))
 
+  ;; unpackers
+  ;; special case fixed values are treated in unpack*
+
+  ;; one byte values
+  (define-unpacker (#xC0 in) '())
+  (define-unpacker (#xC2 in) #f)
+  (define-unpacker (#xC3 in) #t)
+
+  ;; bin 8 - 32
+  (define-unpacker (#xC4 in) (get-data in #f 1))
+  (define-unpacker (#xC5 in) (get-data in #f 2))
+  (define-unpacker (#xC6 in) (get-data in #f 4))
+
+  ;; uint8 - 64
+  (define-unpacker (#xCC in) (bytevector-u8-ref (get-data in 1 #f) 0))
+  (define-unpacker (#xCD in) (bytevector-u16b-ref (get-data in 2 #f) 0))
+  (define-unpacker (#xCE in) (bytevector-u32b-ref (get-data in 4 #f) 0))
+  (define-unpacker (#xCF in) (bytevector-u64b-ref (get-data in 8 #f) 0))
+
+  ;; int8 - 64
+  (define-unpacker (#xD0 in) (bytevector-u8-ref (get-data in 1 #f) 0))
+  (define-unpacker (#xD1 in) (bytevector-u16b-ref (get-data in 2 #f) 0))
+  (define-unpacker (#xD2 in) (bytevector-u32b-ref (get-data in 4 #f) 0))
+  (define-unpacker (#xD3 in) (bytevector-u64b-ref (get-data in 8 #f) 0))
+
+  ;; TODO fixext 1 - 16
+
+  ;; str 8 - 32
+  (define-unpacker (#xC4 in) (utf8->string (get-data in #f 1)))
+  (define-unpacker (#xC5 in) (utf8->string (get-data in #f 2)))
+  (define-unpacker (#xC6 in) (utf8->string (get-data in #f 4)))
+
+  ;; array 16 32
+  (define-unpacker (#xDC in) (unpack-array in #f 2))
+  (define-unpacker (#xDD in) (unpack-array in #f 4))
+
+  ;; map 16 32
+  (define-unpacker (#xDE in) (unpack-map in #f 2))
+  (define-unpacker (#xDF in) (unpack-map in #f 4))
 )
