@@ -28,67 +28,15 @@
 ;;;   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ;;;
 
+;; 6 Sep 2013 - adjust MessagePack update proposal v5
+
 #!r6rs
 (library (msgpack)
     (export pack! pack pack-size
 	    unpack)
     (import (for (rnrs) run expand)
 	    (for (rnrs eval) expand)
-	    ;; Ypsilon doesn't allow this style
-	    ;; (srfi :39 parameters)
-	    (srfi :39))
-  ;; for convenience
-  (define-syntax let-optionals*
-    (syntax-rules ()
-      ((let-optionals* arg (opt-clause ...) body ...)
-       (let ((rest arg))
-         (%let-optionals* rest (opt-clause ...) body ...)))))
-
-  (define-syntax %let-optionals*
-    (syntax-rules ()
-      ((%let-optionals* arg (((var ...) xparser) opt-clause ...) body ...)
-       (let-values (((rest var ...) (xparser arg)))
-	 (%let-optionals* rest (opt-clause ...) body ...)))
-
-      ((%let-optionals* arg ((var default) opt-clause ...) body ...)
-       (let-values (((var rest) (if (null? arg)
-				    (values default '())
-				    (values (car arg) (cdr arg)))))
-	 (%let-optionals* rest (opt-clause ...) body ...)))
-
-      ((%let-optionals* arg ((var default test) opt-clause ...) body ...)
-       (let-values (((var rest) (if (null? arg)
-				    (values default '())
-				    (let ((var (car arg)))
-				      (if test 
-					  (values var (cdr arg))
-					  (error "arg failed LET-OPT test"
-						 var))))))
-	 (%let-optionals* rest (opt-clause ...) body ...)))
-
-      ((%let-optionals* arg ((var default test supplied?) opt-clause ...)
-			body ...)
-       (let-values (((var supplied? rest)
-		     (if (null? arg) (values default #f '())
-			 (let ((var (car arg)))
-			   (if test (values var #t (cdr arg))
-			       (error "arg failed LET-OPT test" var))))))
-	 (%let-optionals* rest (opt-clause ...) body ...)))
-
-      ((%let-optionals* arg (rest) body ...)
-       (let ((rest arg)) body ...))
-
-      ((%let-optionals* arg () body ...)
-       (if (null? arg) (begin body ...)
-           (error "Too many arguments in let-opt" arg)))))
-
-
-  ;; internal parameters
-  ;; for pack
-  (define *string->message* (make-parameter string->utf8))
-
-  ;; for unpack
-  (define *message->string* (make-parameter utf8->string))
+	    (rnrs mutable-pairs))
 
   (define-syntax ash (identifier-syntax bitwise-arithmetic-shift))
   ;; constant values
@@ -107,21 +55,102 @@
 		 (syntax-case y ()
 		   (var (identifier? #'var) value)))))))))
 
+  (define-constant $2^8  (- (expt 2  8) 1))
   (define-constant $2^16 (- (expt 2 16) 1))
   (define-constant $2^32 (- (expt 2 32) 1))
+
+  ;; Tags from spec (ordered by category)
+  ;; I wish it has more organised tag but this might be a
+  ;; backward compatibility so don't blame... *sigh*
+  ;;
+  ;;                  | first byte  | first byte 
+  ;;     format name  | (in binary) | (in hex)
+  ;; -----------------+-------------+--------------
+  ;; positive fixint  |  0xxxxxxx   | 0x00 - 0x7f
+  ;; fixmap           |  1000xxxx   | 0x80 - 0x8f
+  ;; fixarray         |  1001xxxx   | 0x90 - 0x9f
+  ;; fixstr           |  101xxxxx   | 0xa0 - 0xbf
+  ;; negative fixint  |  111xxxxx   | 0xe0 - 0xff
+  ;; 
+  ;; nil              |  11000000   | 0xc0
+  ;; (never used)     |  11000001   | 0xc1
+  ;; false 	      |	 11000010   | 0xc2
+  ;; true 	      |	 11000011   | 0xc3
+  ;; 
+  ;; bin 8 	      |	 11000100   | 0xc4
+  ;; bin 16 	      |	 11000101   | 0xc5
+  ;; bin 32 	      |	 11000110   | 0xc6
+  ;; ext 8 	      |	 11000111   | 0xc7
+  ;; ext 16 	      |	 11001000   | 0xc8
+  ;; ext 32 	      |	 11001001   | 0xc9
+  ;;
+  ;; float 32 	      |	 11001010   | 0xca
+  ;; float 64 	      |	 11001011   | 0xcb
+  ;;
+  ;; uint 8 	      |	 11001100   | 0xcc
+  ;; uint 16 	      |	 11001101   | 0xcd
+  ;; uint 32 	      |	 11001110   | 0xce
+  ;; uint 64 	      |	 11001111   | 0xcf
+  ;; int 8 	      |	 11010000   | 0xd0
+  ;; int 16 	      |	 11010001   | 0xd1
+  ;; int 32 	      |	 11010010   | 0xd2
+  ;; int 64 	      |	 11010011   | 0xd3
+  ;;
+  ;; fixext 1 	      |	 11010100   | 0xd4
+  ;; fixext 2 	      |	 11010101   | 0xd5
+  ;; fixext 4 	      |	 11010110   | 0xd6
+  ;; fixext 8 	      |	 11010111   | 0xd7
+  ;; fixext 16 	      |	 11011000   | 0xd8
+  ;;
+  ;; str 8 	      |	 11011001   | 0xd9
+  ;; str 16 	      |	 11011010   | 0xda
+  ;; str 32 	      |	 11011011   | 0xdb
+  ;;
+  ;; array 16 	      |	 11011100   | 0xdc
+  ;; array 32 	      |	 11011101   | 0xdd
+  ;; map 16 	      |	 11011110   | 0xde
+  ;; map 32 	      |	 11011111   | 0xdf
+
+  (define *pack-table* '())
+  (define *unpack-table* (make-eqv-hashtable))
+  (define (add-pack-table! pred proc)
+    ;; the last in will be used if there is the same pred
+    (set! *pack-table* (cons (cons pred proc) *pack-table*)))
+  (define-syntax define-packer
+    (syntax-rules ()
+      ((_ (pred . args) body ...)
+       (define-packer pred (lambda args body ...)))
+      ((_ pred proc)
+       (add-pack-table! pred proc))))
+
+  (define-syntax define-unpacker
+    (syntax-rules (unpack)
+      ((_ tag (unpack args body ...))
+       (define-unpacker tag (lambda args body ...)))
+      ((_ tag proc)
+       (hashtable-set! *unpack-table* tag proc))))
+
 
   ;; map and array header writer
   (define-syntax define-header-writer
     (syntax-rules ()
       ((_ name bv offset small-tag mid-tag large-tag)
-       (define-header-writer name bv offset small-tag mid-tag large-tag 15))
-      ((_ name bv offset small-tag mid-tag large-tag small-len)
+       (define-header-writer name bv offset #f small-tag mid-tag large-tag))
+      ((_ name bv offset fx-tag small-tag mid-tag large-tag)
+       (define-header-writer name bv offset 
+	 fx-tag small-tag mid-tag large-tag 15))
+      ((_ name bv offset fx-tag small-tag mid-tag large-tag fx-len)
        (define (name n)
-	 (cond ((<= n small-len)
-		(let ((tag (bitwise-ior small-tag n)))
+	 (cond ((and fx-tag (<= n fx-len))
+		(let ((tag (bitwise-ior fx-tag n)))
 		  (when bv
 		    (bytevector-u8-set! bv offset tag))
 		  (+ offset 1)))
+	       ((and small-tag (<= n $2^8))
+		(when bv
+		  (bytevector-u8-set! bv offset small-tag)
+		  (bytevector-u8-set! bv (+ offset 1) n))
+		(+ offset 2))
 	       ((<= n $2^16)
 		(when bv
 		  (bytevector-u8-set! bv offset mid-tag)
@@ -133,28 +162,8 @@
 		  (bytevector-u32-set! bv (+ offset 1) n (endianness big)))
 		(+ offset 5)))))))
 
-  (define (pack-map! bv message offset)
-    (define-header-writer write-header! bv offset #b10000000 #xDE #xDF)
-    (let ((new-offset (write-header! (length message))))
-      (let loop ((message message)
-		 (offset new-offset))
-	(cond ((null? message) offset)
-	      ((pair? (car message))
-	       (let* ((key-off (pack-atom! bv (caar message) offset))
-		      (value-off (pack!* bv (cdar message) key-off)))
-		 (loop (cdr message) value-off)))
-	      (else
-	       (error 'pack-map! "alist is required" message))))))
-
-  (define (pack-array! bv message offset)
-    (define-header-writer write-header! bv offset #b10010000 #xDC #xDD)
-    (let* ((msg-len (vector-length message))
-	   (new-offset (write-header! msg-len)))
-      (let loop ((i 0) (offset new-offset))
-	(if (= i msg-len)
-	    offset
-	    (loop (+ i 1) (pack!* bv (vector-ref message i) offset))))))
-
+  ;; helpers
+  ;; integer packer helpers
   (define (pack-uint! bv message offset)
     (cond ((<= message #xFF)
 	   (when bv
@@ -203,74 +212,24 @@
 	  (else
 	   (error 'pack-sint! "given value is out of range" message))))
 
-  (define (pack-integer! bv message offset)
-    ;; for now only fixnum
-    (cond ((<= 0 message 127)
-	   (when bv
-	     (bytevector-u8-set! bv offset message))
-	   (+ offset 1))
-	  ((<= -32 message -1)
-	   (when bv
-	     (bytevector-u8-set! bv offset 
-				 (bitwise-ior #b11100000 (abs message))))
-	   (+ offset 1))
-	  ((positive? message) (pack-uint! bv message offset))
-	  ((negative? message) (pack-sint! bv message offset))
-	  (else (error 'pack-integer! "should not be here!" message))))
-
-  (define (pack-real! bv message offset)
-    ;; we use only double, so floating points are always big...
-    ;; FIXME
-    ;; Is there a way to determine if the message is float or doubl?
-    (when bv
-      (bytevector-u8-set! bv offset #xCB)
-      (bytevector-ieee-double-set! bv (+ offset 1) message (endianness big)))
-    (+ offset 9))
-
-  (define (pack-raw-bytes! bv message offset)
-    (define-header-writer write-header! bv offset #b10100000 #xDA #xDB 31)
-    (let* ((msg-len (bytevector-length message))
-	   (new-offset (write-header! msg-len)))
-      (when bv
-	(bytevector-copy! message 0 bv new-offset msg-len))
-      (+ new-offset msg-len)))
-
-  (define (pack-atom! bv message offset)
-    (cond ((flonum? message)
-	   (pack-real! bv message offset))
-	  ((integer? message)
-	   (pack-integer! bv message offset))
-	  ((boolean? message)
-	   (when bv (bytevector-u8-set! bv offset (if message #xC3 #xC2)))
-	   (+ offset 1))
-	  ((null? message)
-	   (when bv (bytevector-u8-set! bv offset #xC0))
-	   (+ offset 1))
-	  ((string? message)
-	   (pack-atom! bv ((*string->message*) message) offset))
-	  ((bytevector? message)
-	   (pack-raw-bytes! bv message offset))
-	  (else
-	   (error 'pack-atom! "not supported yet" message))))
 
   (define (pack!* bv message offset)
-    (cond ((pair? message) (pack-map! bv message offset))
-	  ((vector? message) (pack-array! bv message offset))
-	  (else (pack-atom! bv message offset))))
+    (do ((slot *pack-table* (cdr slot)))
+	((or (null? slot) ((caar slot) message))
+	 (if (null? slot)
+	     (error 'pack "the message is not supported" message)
+	     ((cdar slot) bv message offset)))))
 
-  (define (pack! bv message . opt)
-    (let-optionals* opt ((offset 0)
-			 (string->message string->utf8))
-      (parameterize ((*string->message* string->message))
-	(pack!* bv message offset))))
+  (define pack! 
+    (case-lambda
+     ((bv message) (pack! bv message 0))
+     ((bv message offset) (pack!* bv message offset))))
 
-  (define (pack-size message . opt)
-    (parameterize ((*string->message* (if (null? opt) string->utf8 (car opt))))
-      (pack!* #f message 0)))
+  (define (pack-size message) (pack!* #f message 0))
 
-  (define (pack message . opt)
-    (let ((bv (make-bytevector (apply pack-size message opt))))
-      (apply pack! bv message 0 opt)
+  (define (pack message)
+    (let ((bv (make-bytevector (pack-size message))))
+      (pack! bv message 0)
       bv))
 
   ;; unpack
@@ -297,7 +256,7 @@
     ;; For R6RS compatible, we can't use extended bytevector-copy.
     (let ((o (make-bytevector count)))
       (bytevector-copy! bv offset o 0 count)
-      (values (+ offset count) ((*message->string*) o))))
+      (values (+ offset count) (utf8->string o))))
 
   (define (unpack-fix-collection bv first offset)
     (case (bitwise-and first #x30)
@@ -368,10 +327,87 @@
 	    (else (error 'unpack "unknown tag" type bv)))))
 
 
-  (define (unpack bv . opt)
-    (let-optionals* opt ((offset 0)
-			 (message->string utf8->string))
-      (parameterize ((*message->string* message->string))
-	(let-values (((_ o) (unpack* bv offset)))
+  (define unpack
+    (case-lambda
+     ((bv) (unpack bv 0))
+     ((bv offset)
+      (let-values (((_ o) (unpack* bv offset)))
 	  o))))
+
+  ;; packers R6RS doesn't allow to put this in between so the bottom
+  (define-packer (null? bv message offset)
+    (when bv (bytevector-u8-set! bv offset #xC0))
+    (+ offset 1))
+
+  (define-packer (boolean? bv message offset)
+    (when bv (bytevector-u8-set! bv offset (if message #xC3 #xC2)))
+    (+ offset 1))
+
+  ;; bin 8 16 32
+  ;; these doesn't have fx*** format
+  (define-packer (bytevector? bv message offset)
+    (define-header-writer write-header! bv offset #xC4 #xC5 #xC6)
+    (let* ((len (bytevector-length message))
+	   (new-offset (write-header! len)))
+      (when bv
+	(bytevector-copy! message 0 bv new-offset len))
+      (+ new-offset len)))
+  ;; ext must be done by user (user extension right?)
+  
+  ;; float 32/ float 64 (we don't support float 32 though)
+  (define-packer (flonum? bv message offset)
+    ;; we use only double, so floating points are always big...
+    ;; FIXME Is there a way to determine if the message is float or double?
+    (when bv
+      (bytevector-u8-set! bv offset #xCB)
+      (bytevector-ieee-double-set! bv (+ offset 1) message (endianness big)))
+    (+ offset 9))
+
+  (define-packer (integer? bv message offset)
+    (cond ((<= 0 message 127)
+	   (when bv
+	     (bytevector-u8-set! bv offset message))
+	   (+ offset 1))
+	  ((<= -32 message -1)
+	   (when bv
+	     (bytevector-u8-set! bv offset 
+				 (bitwise-ior #b11100000 (abs message))))
+	   (+ offset 1))
+	  ((positive? message) (pack-uint! bv message offset))
+	  ((negative? message) (pack-sint! bv message offset))
+	  (else (error 'pack-integer! "should not be here!" message))))
+
+  (define-packer (string? bv message offset)
+    (define-header-writer write-header! bv offset #b10100000 #xD9 #xDA #xDB 31)
+    (let* ((message (string->utf8 message))
+	   (msg-len (bytevector-length message))
+	   (new-offset (write-header! msg-len)))
+      (when bv
+	(bytevector-copy! message 0 bv new-offset msg-len))
+      (+ new-offset msg-len)))
+
+
+  (define-packer (pair? bv message offset)
+    (define-header-writer write-header! bv offset #b10000000 #f #xDE #xDF)
+    (let ((new-offset (write-header! (length message))))
+      (let loop ((message message)
+		 (offset new-offset))
+	(cond ((null? message) offset)
+	      ((pair? (car message))
+	       ;; should we reject if the key is pair/vector?
+	       (let* ((key-off (pack!* bv (caar message) offset))
+		      (value-off (pack!* bv (cdar message) key-off)))
+		 (loop (cdr message) value-off)))
+	      (else
+	       (error 'pack-map! "alist is required" message))))))
+
+  (define-packer (vector? bv message offset)
+    (define-header-writer write-header! bv offset #b10010000 #xDC #xDD)
+    (let* ((msg-len (vector-length message))
+	   (new-offset (write-header! msg-len)))
+      (let loop ((i 0) (offset new-offset))
+	(if (= i msg-len)
+	    offset
+	    (loop (+ i 1) (pack!* bv (vector-ref message i) offset))))))
+
 )
