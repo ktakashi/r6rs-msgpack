@@ -49,8 +49,11 @@
 
 (check (pack "30") => #vu8(#xA2 #x33 #x30))
 (check (pack "abc") => #vu8(#b10100011 97 98 99))
+(check (pack "0123456789abcdef0123456789abcde")
+       => #vu8(#b10111111 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101))
+;; str 8 is introduced...
 (check (pack "0123456789abcdef0123456789abcdef")
-       => #vu8(#xDA 0 32 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102))
+       => #vu8(#xD9 32 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102 48 49 50 51 52 53 54 55 56 57 97 98 99 100 101 102))
 
 ;; map
 (check (pack '(("40" . ()))) => #vu8(#x81 #xA2 #x34 #x30 #xC0))
@@ -119,7 +122,8 @@
 (check (unpack (pack '(("foo" . #t) ("data" . #(1 2 3)))))
        => '(("foo" . #t) ("data" . #(1 2 3))))
 
-;; converter
+;; since some version msg pack supports string
+#|
 (check (pack "30" string->utf16) => #vu8(#b10100100 #x00 #x33 #x00 #x30))
 (check (unpack #vu8(#b10100100 #x00 #x33 #x00 #x30) 0
 	       (lambda (bv) (utf16->string bv (endianness big)))) => "30")
@@ -127,5 +131,5 @@
 (check (unpack (pack '(("30". #t)) string->utf16)
 	       0 (lambda (bv) (utf16->string bv (endianness big))))
        => '(("30". #t)))
-
+|#
 (check-report)

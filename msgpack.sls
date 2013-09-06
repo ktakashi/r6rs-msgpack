@@ -285,20 +285,24 @@
 	      (loop (+ i 1)))))))
 
   (define (unpack* in)
-    (let ((type (get-u8 in)))
-      ;; handle special case first
-      ;;(display (number->string type 16)) (newline)
-      (cond ((eof-object? type) (error 'unpack "unexpected eof"))
-	    ((zero? (bitwise-and type #x80)) type)
-	    ((= (bitwise-and type #xE0) #xE0) ;; negative fixint
-	     (- (bitwise-and type #x1F)))
-	    ((= (bitwise-and type #xA0) #xA0) ;; fixstr
+    (define (fixed-collection in type)
+      (cond ((= (bitwise-and type #xA0) #xA0) ;; fixstr
 	     (let ((bv (get-data in (bitwise-and type #x1F) #f)))
 	       (utf8->string bv)))
 	    ((= (bitwise-and type #x90) #x90) ;; fixarray
 	     (unpack-array in (bitwise-and type #x0F) #f))
 	    ((= (bitwise-and type #x80) #x80) ;; fixmap
 	     (unpack-map in (bitwise-and type #x0F) #f))
+	    (else ;; something we don't know
+	     (error 'unpack "unknown tag appeared" type))))
+    (let ((type (get-u8 in)))
+      ;; handle special case first
+      (cond ((eof-object? type) (error 'unpack "unexpected eof"))
+	    ((zero? (bitwise-and type #x80)) type)
+	    ((= (bitwise-and type #xE0) #xE0) ;; negative fixint
+	     (- (bitwise-and type #x1F) 32))
+	    ((= (bitwise-and type #xC0) #x80) ;; fixed collection
+	     (fixed-collection in type))
 	    (else
 	     ;; dispatch
 	     (let ((proc (hashtable-ref *unpack-table* type #f)))
@@ -406,6 +410,12 @@
   (define-unpacker (#xC5 in) (get-data in #f 2))
   (define-unpacker (#xC6 in) (get-data in #f 4))
 
+  ;; float 32 and 64
+  (define-unpacker (#xCA in) 
+    (bytevector-ieee-single-ref (get-data in 4 #f) 0 (endianness big)))
+  (define-unpacker (#xCB in) 
+    (bytevector-ieee-double-ref (get-data in 8 #f) 0 (endianness big)))
+
   ;; uint8 - 64
   (define-unpacker (#xCC in) (bytevector-u8-ref (get-data in 1 #f) 0))
   (define-unpacker (#xCD in) (bytevector-u16b-ref (get-data in 2 #f) 0))
@@ -413,17 +423,17 @@
   (define-unpacker (#xCF in) (bytevector-u64b-ref (get-data in 8 #f) 0))
 
   ;; int8 - 64
-  (define-unpacker (#xD0 in) (bytevector-u8-ref (get-data in 1 #f) 0))
-  (define-unpacker (#xD1 in) (bytevector-u16b-ref (get-data in 2 #f) 0))
-  (define-unpacker (#xD2 in) (bytevector-u32b-ref (get-data in 4 #f) 0))
-  (define-unpacker (#xD3 in) (bytevector-u64b-ref (get-data in 8 #f) 0))
+  (define-unpacker (#xD0 in) (bytevector-s8-ref (get-data in 1 #f) 0))
+  (define-unpacker (#xD1 in) (bytevector-s16b-ref (get-data in 2 #f) 0))
+  (define-unpacker (#xD2 in) (bytevector-s32b-ref (get-data in 4 #f) 0))
+  (define-unpacker (#xD3 in) (bytevector-s64b-ref (get-data in 8 #f) 0))
 
   ;; TODO fixext 1 - 16
 
   ;; str 8 - 32
-  (define-unpacker (#xC4 in) (utf8->string (get-data in #f 1)))
-  (define-unpacker (#xC5 in) (utf8->string (get-data in #f 2)))
-  (define-unpacker (#xC6 in) (utf8->string (get-data in #f 4)))
+  (define-unpacker (#xD9 in) (utf8->string (get-data in #f 1)))
+  (define-unpacker (#xDA in) (utf8->string (get-data in #f 2)))
+  (define-unpacker (#xDB in) (utf8->string (get-data in #f 4)))
 
   ;; array 16 32
   (define-unpacker (#xDC in) (unpack-array in #f 2))
