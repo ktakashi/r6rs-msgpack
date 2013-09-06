@@ -3,6 +3,34 @@
 	(msgpack)
 	(srfi :78 lightweight-testing))
 
+(define-record-type ext
+  (fields a))
+
+(define-record-type my-ext
+  (fields a b c))
+
+(define-ext-pack (ext? #x01 m)
+  (let ((bv (make-bytevector 1)))
+    (bytevector-u8-set! bv 0 (ext-a m))
+    bv))
+
+(define-ext-unpack (#x01 bv)
+  (let ((a (bytevector-u8-ref bv 0)))
+    (make-ext a)))
+
+(define-ext-pack (my-ext? #x00 m)
+  (let ((bv (make-bytevector 3)))
+    (bytevector-u8-set! bv 0 (my-ext-a m))
+    (bytevector-u8-set! bv 1 (my-ext-b m))
+    (bytevector-u8-set! bv 2 (my-ext-c m))
+    bv))
+
+(define-ext-unpack (#x00 bv)
+  (let ((a (bytevector-u8-ref bv 0))
+	(b (bytevector-u8-ref bv 1))
+	(c (bytevector-u8-ref bv 2)))
+    (make-my-ext a b c)))
+
 (check-set-mode! 'report-failed)
 
 ;; simple value checks
@@ -122,14 +150,10 @@
 (check (unpack (pack '(("foo" . #t) ("data" . #(1 2 3)))))
        => '(("foo" . #t) ("data" . #(1 2 3))))
 
-;; since some version msg pack supports string
-#|
-(check (pack "30" string->utf16) => #vu8(#b10100100 #x00 #x33 #x00 #x30))
-(check (unpack #vu8(#b10100100 #x00 #x33 #x00 #x30) 0
-	       (lambda (bv) (utf16->string bv (endianness big)))) => "30")
+;; ext
+(check (pack (make-ext 1)) => #vu8(#xD4 #x01 1))
+(check (unpack #vu8(#xD4 #x01 1)) => (make-ext 1))
+(check (pack (make-my-ext 1 2 3)) => #vu8(#xC7 #x03 #x00 1 2 3))
+(check (unpack #vu8(#xC7 #x03 #x00 1 2 3)) => (make-my-ext 1 2 3))
 
-(check (unpack (pack '(("30". #t)) string->utf16)
-	       0 (lambda (bv) (utf16->string bv (endianness big))))
-       => '(("30". #t)))
-|#
 (check-report)

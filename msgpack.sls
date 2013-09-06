@@ -33,7 +33,10 @@
 #!r6rs
 (library (msgpack)
     (export pack! pack pack-size
-	    unpack)
+	    unpack get-unpack
+	    ;; extension
+	    define-ext-pack
+	    define-ext-unpack)
     (import (for (rnrs) run expand)
 	    (for (rnrs eval) expand)
 	    (rnrs mutable-pairs))
@@ -112,10 +115,17 @@
   ;; map 32 	      |	 11011111   | 0xdf
 
   (define *pack-table* '())
+  ;; extended thing alist of pred type proc
+  (define *ext-pack-table* '())
   (define *unpack-table* (make-eqv-hashtable))
+  ;; type and proc (no tag)
+  (define *ext-unpack-table* (make-eqv-hashtable))
   (define (add-pack-table! pred proc)
     ;; the last in will be used if there is the same pred
     (set! *pack-table* (cons (cons pred proc) *pack-table*)))
+  (define (add-ext-pack-table! pred type proc)
+    (set! *ext-pack-table* (cons (cons* pred type proc) *ext-pack-table*)))
+
   (define-syntax define-packer
     (syntax-rules ()
       ((_ (pred . args) body ...)
@@ -130,6 +140,19 @@
       ((_ tag proc)
        (hashtable-set! *unpack-table* tag proc))))
 
+  (define-syntax define-ext-pack
+    (syntax-rules ()
+      ((_ (pred type . args) body ...)
+       (define-ext-pack pred type (lambda args body ...)))
+      ((_ pred type proc)
+       (add-ext-pack-table! pred type proc))))
+
+  (define-syntax define-ext-unpack
+    (syntax-rules ()
+      ((_ (type . args) body ...)
+       (define-ext-unpack type (lambda args body ...)))
+      ((_ type proc)
+       (hashtable-set! *ext-unpack-table* type proc))))
 
   ;; map and array header writer
   (define-syntax define-header-writer
@@ -212,13 +235,54 @@
 	  (else
 	   (error 'pack-sint! "given value is out of range" message))))
 
-
+  (define *fixexts* '((1 . #xD4) (2 . #xD5) (4 . #xD6) (8 . #xD7) (16 . #xD8)))
   (define (pack!* bv message offset)
+    (define (fixedext type m size offset)
+      (when bv
+	(bytevector-u8-set! bv offset type)
+	(bytevector-copy! m 0 bv (+ offset 1) size))
+      (+ offset 1 size))
+    (define (emitext type m size offset)
+      (let ((offset (cond ((<= size $2^8)
+			   (when bv (bytevector-u8-set! bv offset size))
+			   (+ offset 1))
+			  ((<= size $2^16)
+			   (when bv
+			     (bytevector-u16-set! bv offset size
+						  (endianness big)))
+			   (+ offset 2))
+			  (else
+			   (when bv
+			     (bytevector-u32-set! bv offset size
+						  (endianness big)))
+			   (+ offset 4)))))
+	(fixedext type m size offset)))
+    (define (check-extension)
+      (let* ((slot (do ((slot *ext-pack-table* (cdr slot)))
+		       ((or (null? slot) ((caar slot) message))
+			(if (null? slot)
+			    (error 'pack "the message is not supported" message)
+			    (car slot)))))
+	     (type (cadr slot))
+	     (bv2 ((cddr slot) message))
+	     (size (bytevector-length bv2)))
+	(let-values (((tag fixed?)
+		      ;; choose the smallest one
+		      (cond ((assv size *fixexts*)
+			     => (lambda (s) (values (cdr s) #t)))
+			    ((<= size $2^8 ) (values #xC7 #f))
+			    ((<= size $2^16) (values #xC8 #f))
+			    ((<= size $2^32) (values #xC9 #f))
+			    (else
+			     (error 'pack "ext size is too big" message)))))
+	  (when bv (bytevector-u8-set! bv offset tag))
+	  (if fixed?
+	      (fixedext type bv2 size (+ offset 1))
+	      (emitext type bv2 size (+ offset 1))))))
     (do ((slot *pack-table* (cdr slot)))
 	((or (null? slot) ((caar slot) message))
 	 (if (null? slot)
-	     ;; TODO ext
-	     (error 'pack "the message is not supported" message)
+	     (check-extension)
 	     ((cdar slot) bv message offset)))))
 
   (define pack! 
@@ -250,20 +314,20 @@
     (bytevector-s64-ref bv index (endianness big)))
 
   (define (get-length in bytes)
-    (let ((bv (get-bytevector-n in bytes)))
-      (case bytes
-	((2) (bytevector-u16b-ref bv 0))
-	((4) (bytevector-u32b-ref bv 0))
-	((8) (bytevector-u64b-ref bv 0))
-	(else (error 'get-data "[internal] must be a bug!" bytes)))))
+    (if (= bytes 1)
+	(get-u8 in)
+	(let ((bv (get-bytevector-n in bytes)))
+	  (case bytes
+	    ((2) (bytevector-u16b-ref bv 0))
+	    ((4) (bytevector-u32b-ref bv 0))
+	    ((8) (bytevector-u64b-ref bv 0))
+	    (else (error 'get-length "[internal] must be a bug!" bytes))))))
 
   (define (get-data in len bytes)
     (if len
 	(get-bytevector-n in len)
-	(if (= bytes 1)
-	    (get-bytevector-n in (get-u8 in))
-	    (let ((n (get-length in bytes)))
-	      (get-bytevector-n in n)))))
+	(let ((n (get-length in bytes)))
+	  (get-bytevector-n in n))))
 
   (define (unpack-map in len bytes) 
     (let ((count (or len (get-length in bytes))))
@@ -310,6 +374,16 @@
 		   (proc in)
 		   ;; TODO ext
 		   (error 'unpack "not supported" type)))))))
+
+  (define (handle-ext-unpack bv)
+    (let ((type (bytevector-u8-ref bv 0)))
+      (cond ((hashtable-ref *ext-unpack-table* type #f)
+	     => (lambda (proc)
+		  (let* ((size (- (bytevector-length bv) 1))
+			 (data (make-bytevector size)))
+		    (bytevector-copy! bv 1 data 0 size)
+		    (proc data))))
+	    (else (error 'ext-unpack "handler is not registered")))))
 
   (define get-unpack unpack*)
 
@@ -410,6 +484,20 @@
   (define-unpacker (#xC5 in) (get-data in #f 2))
   (define-unpacker (#xC6 in) (get-data in #f 4))
 
+  ;; ext 8 - 32
+  (define-unpacker (#xC7 in) 
+    (let* ((n (get-length in 1))
+	   (bv (get-data in (+ n 1) #f)))
+      (handle-ext-unpack bv)))
+  (define-unpacker (#xC8 in)
+    (let* ((n (get-length in 2))
+	   (bv (get-data in (+ n 1) #f)))
+      (handle-ext-unpack bv)))
+  (define-unpacker (#xC9 in)
+    (let* ((n (get-length in 2))
+	   (bv (get-data in (+ n 1) #f)))
+      (handle-ext-unpack bv)))
+
   ;; float 32 and 64
   (define-unpacker (#xCA in) 
     (bytevector-ieee-single-ref (get-data in 4 #f) 0 (endianness big)))
@@ -429,6 +517,11 @@
   (define-unpacker (#xD3 in) (bytevector-s64b-ref (get-data in 8 #f) 0))
 
   ;; TODO fixext 1 - 16
+  (define-unpacker (#xD4 in) (handle-ext-unpack (get-data in 2 	#f)))
+  (define-unpacker (#xD5 in) (handle-ext-unpack (get-data in 3 	#f)))
+  (define-unpacker (#xD6 in) (handle-ext-unpack (get-data in 5 	#f)))
+  (define-unpacker (#xD7 in) (handle-ext-unpack (get-data in 9 	#f)))
+  (define-unpacker (#xD8 in) (handle-ext-unpack (get-data in 17 #f)))
 
   ;; str 8 - 32
   (define-unpacker (#xD9 in) (utf8->string (get-data in #f 1)))
@@ -442,4 +535,5 @@
   ;; map 16 32
   (define-unpacker (#xDE in) (unpack-map in #f 2))
   (define-unpacker (#xDF in) (unpack-map in #f 4))
+
 )
